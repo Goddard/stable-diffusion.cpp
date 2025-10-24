@@ -623,6 +623,27 @@ std::string convert_tensor_name(std::string name) {
     if (starts_with(name, "diffusion_model")) {
         name = "model." + name;
     }
+        // Handle kontext model tensors that don't have the diffusion_model prefix
+        else if (starts_with(name, "double_blocks.") ||
+                 starts_with(name, "time_in.") ||
+                 starts_with(name, "txt_in.") ||
+                 starts_with(name, "vector_in.") ||
+                 starts_with(name, "joint_blocks.") ||
+                 starts_with(name, "output_blocks.") ||
+                 starts_with(name, "input_blocks.") ||
+                 starts_with(name, "patch_embedding.") ||
+                 starts_with(name, "img_emb.") ||
+                 starts_with(name, "time_embedding.") ||
+                 starts_with(name, "proj_out.") ||
+                 starts_with(name, "proj_in.") ||
+                 starts_with(name, "final_layer.") ||
+                 starts_with(name, "img_in.") ||
+                 starts_with(name, "adaLN_modulation.") ||
+                 starts_with(name, "linear.") ||
+                 starts_with(name, "guidance_in.") ||
+                 starts_with(name, "single_blocks.")) {
+            name = "model.diffusion_model." + name;
+        }
     // size_t pos = name.find("lora_A");
     // if (pos != std::string::npos) {
     //     name.replace(pos, strlen("lora_A"), "lora_up");
@@ -1780,6 +1801,14 @@ SDVersion ModelLoader::get_sd_version() {
     for (auto& tensor_storage : tensor_storages) {
         if (!(is_xl || is_flux)) {
             if (tensor_storage.name.find("model.diffusion_model.double_blocks.") != std::string::npos) {
+                is_flux = true;
+                if (input_block_checked) {
+                    break;
+                }
+            }
+            // Add support for Kontext model tensor naming
+            if (tensor_storage.name.find("double_blocks.") != std::string::npos && 
+                tensor_storage.name.find("img_attn") != std::string::npos) {
                 is_flux = true;
                 if (input_block_checked) {
                     break;
