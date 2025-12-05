@@ -112,11 +112,18 @@ const char* unused_tensors[] = {
     "text_encoders.llm.output.weight",
     "text_encoders.llm.lm_head.",
     "first_stage_model.bn.",
+    "text_encoders.t5xxl.transformer.scaled_fp8",  // FP8 marker tensor (shape [0])
+    ".scale_weight",  // FP8 per-tensor scale factors (TODO: apply during F8→F16 conversion)
 };
 
 bool is_unused_tensor(std::string name) {
     for (size_t i = 0; i < sizeof(unused_tensors) / sizeof(const char*); i++) {
-        if (starts_with(name, unused_tensors[i])) {
+        const char* pattern = unused_tensors[i];
+        if (starts_with(name, pattern)) {
+            return true;
+        }
+        // Patterns starting with '.' are treated as suffixes (e.g., ".scale_weight")
+        if (pattern[0] == '.' && ends_with(name, pattern)) {
             return true;
         }
     }
@@ -221,6 +228,15 @@ void f8_e4m3_to_f16_vec(uint8_t* src, uint16_t* dst, int64_t n) {
     // support inplace op
     for (int64_t i = n - 1; i >= 0; i--) {
         dst[i] = f8_e4m3_to_f16(src[i]);
+    }
+}
+
+void f8_e4m3_to_f16_vec_scaled(uint8_t* src, uint16_t* dst, int64_t n, float scale) {
+    // support inplace op, apply scale during conversion
+    for (int64_t i = n - 1; i >= 0; i--) {
+        uint16_t f16 = f8_e4m3_to_f16(src[i]);
+        float f32 = ggml_fp16_to_fp32(f16) * scale;
+        dst[i] = ggml_fp32_to_fp16(f32);
     }
 }
 
@@ -394,7 +410,10 @@ bool ModelLoader::init_from_file(const std::string& file_path, const std::string
 }
 
 void ModelLoader::convert_tensors_name() {
-    SDVersion version = (version_ == VERSION_COUNT) ? get_sd_version() : version_;
+    if (version_ == VERSION_COUNT) {
+        version_ = get_sd_version();
+    }
+    SDVersion version = version_;
     String2TensorStorage new_map;
 
     for (auto& [_, tensor_storage] : tensor_storage_map) {
@@ -1042,6 +1061,11 @@ bool ModelLoader::init_from_ckpt_file(const std::string& file_path, const std::s
 }
 
 SDVersion ModelLoader::get_sd_version() {
+    // Return cached version if already determined
+    if (version_ != VERSION_COUNT) {
+        return version_;
+    }
+    
     TensorStorage token_embedding_weight, input_block_weight;
 
     bool has_multiple_encoders = false;
@@ -1056,7 +1080,9 @@ SDVersion ModelLoader::get_sd_version() {
 
     for (auto& [name, tensor_storage] : tensor_storage_map) {
         if (!(is_xl)) {
-            if (tensor_storage.name.find("model.diffusion_model.double_blocks.") != std::string::npos) {
+            // Check for Flux with or without model.diffusion_model. prefix (GGUF files may not have prefix)
+            if (tensor_storage.name.find("model.diffusion_model.double_blocks.") != std::string::npos ||
+                (tensor_storage.name.find("double_blocks.") == 0)) {
                 is_flux = true;
             }
             if (tensor_storage.name.find("model.diffusion_model.nerf_final_layer_conv.") != std::string::npos) {
@@ -1117,6 +1143,7 @@ SDVersion ModelLoader::get_sd_version() {
         }
         if (tensor_storage.name == "model.diffusion_model.input_blocks.0.0.weight" ||
             tensor_storage.name == "model.diffusion_model.img_in.weight" ||
+            tensor_storage.name == "img_in.weight" ||  // GGUF without prefix
             tensor_storage.name == "unet.conv_in.weight") {
             input_block_weight = tensor_storage;
         }
@@ -1364,6 +1391,26 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
 
     int64_t start_time = ggml_time_ms();
 
+    // Preload FP8 scale weights (they're small - just 1 float each)
+    std::map<std::string, float> fp8_scale_map;
+    for (const auto& [name, tensor_storage] : tensor_storage_map) {
+        if (name.find(".scale_weight") != std::string::npos && tensor_storage.nelements() == 1) {
+            // Read the scale value directly
+            std::ifstream file(file_paths_[tensor_storage.file_index], std::ios::binary);
+            if (file.is_open()) {
+                file.seekg(tensor_storage.offset);
+                float scale_value = 1.0f;
+                file.read(reinterpret_cast<char*>(&scale_value), sizeof(float));
+                // Get the base tensor name (remove .scale_weight suffix)
+                std::string base_name = name.substr(0, name.length() - 13);  // ".scale_weight" is 13 chars
+                fp8_scale_map[base_name] = scale_value;
+            }
+        }
+    }
+    if (!fp8_scale_map.empty()) {
+        LOG_DEBUG("preloaded %zu FP8 scale weights", fp8_scale_map.size());
+    }
+
     std::vector<TensorStorage> processed_tensor_storages;
     for (const auto& [name, tensor_storage] : tensor_storage_map) {
         if (is_unused_tensor(tensor_storage.name)) {
@@ -1413,7 +1460,7 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
         std::vector<std::thread> workers;
 
         for (int i = 0; i < n_threads; ++i) {
-            workers.emplace_back([&, file_path, is_zip]() {
+            workers.emplace_back([&, file_path, is_zip, &fp8_scale_map]() {
                 std::ifstream file;
                 struct zip_t* zip = nullptr;
                 if (is_zip) {
@@ -1525,7 +1572,13 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
                     if (tensor_storage.is_bf16) {
                         bf16_to_f32_vec((uint16_t*)read_buf, (float*)target_buf, tensor_storage.nelements());
                     } else if (tensor_storage.is_f8_e4m3) {
-                        f8_e4m3_to_f16_vec((uint8_t*)read_buf, (uint16_t*)target_buf, tensor_storage.nelements());
+                        // Check for FP8 scale weight
+                        auto scale_it = fp8_scale_map.find(tensor_storage.name);
+                        if (scale_it != fp8_scale_map.end()) {
+                            f8_e4m3_to_f16_vec_scaled((uint8_t*)read_buf, (uint16_t*)target_buf, tensor_storage.nelements(), scale_it->second);
+                        } else {
+                            f8_e4m3_to_f16_vec((uint8_t*)read_buf, (uint16_t*)target_buf, tensor_storage.nelements());
+                        }
                     } else if (tensor_storage.is_f8_e5m2) {
                         f8_e5m2_to_f16_vec((uint8_t*)read_buf, (uint16_t*)target_buf, tensor_storage.nelements());
                     } else if (tensor_storage.is_f64) {
@@ -1614,6 +1667,11 @@ bool ModelLoader::load_tensors(std::map<std::string, struct ggml_tensor*>& tenso
         } else {
             for (auto& ignore_tensor : ignore_tensors) {
                 if (starts_with(name, ignore_tensor)) {
+                    return true;
+                }
+                // Also check for suffix patterns (e.g., ".scale_weight")
+                if (ignore_tensor.length() > 0 && ignore_tensor[0] == '.' && 
+                    ends_with(name, ignore_tensor)) {
                     return true;
                 }
             }

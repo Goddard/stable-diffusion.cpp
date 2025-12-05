@@ -1044,6 +1044,28 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
 
     replace_with_prefix_map(name, prefix_map);
 
+    // Handle Flux GGUF models with unprefixed tensor names
+    // These need model.diffusion_model. prefix added
+    if (sd_version_is_flux(version)) {
+        std::vector<std::string> flux_layer_prefixes = {
+            "double_blocks.",
+            "single_blocks.",
+            "img_in.",
+            "txt_in.",
+            "time_in.",
+            "vector_in.",
+            "guidance_in.",
+            "final_layer.",
+            "pe_embedder.",
+        };
+        for (const auto& flux_prefix : flux_layer_prefixes) {
+            if (starts_with(name, flux_prefix)) {
+                name = "model.diffusion_model." + name;
+                break;
+            }
+        }
+    }
+
     // diffusion model
     {
         for (const auto& prefix : diffuison_model_prefix_vec) {
