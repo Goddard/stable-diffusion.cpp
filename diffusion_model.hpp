@@ -343,18 +343,38 @@ struct QwenImageModel : public DiffusionModel {
         qwen_image.set_flash_attention_enabled(enabled);
     }
 
+    // Set control signals for ControlNet DiT integration
+    void set_control_signals(const std::vector<ggml_tensor*>& controls, float strength = 1.0f) {
+        qwen_image.qwen_image.control_signals = controls;
+        qwen_image.qwen_image.control_strength = strength;
+    }
+
+    void clear_control_signals() {
+        qwen_image.qwen_image.control_signals.clear();
+    }
+
     void compute(int n_threads,
                  DiffusionParams diffusion_params,
                  struct ggml_tensor** output     = nullptr,
                  struct ggml_context* output_ctx = nullptr) override {
-        return qwen_image.compute(n_threads,
-                                  diffusion_params.x,
-                                  diffusion_params.timesteps,
-                                  diffusion_params.context,
-                                  diffusion_params.ref_latents,
-                                  true,  // increase_ref_index
-                                  output,
-                                  output_ctx);
+        // Apply ControlNet DiT signals if provided
+        if (!diffusion_params.controls.empty()) {
+            set_control_signals(diffusion_params.controls, diffusion_params.control_strength);
+        }
+
+        qwen_image.compute(n_threads,
+                           diffusion_params.x,
+                           diffusion_params.timesteps,
+                           diffusion_params.context,
+                           diffusion_params.ref_latents,
+                           diffusion_params.increase_ref_index,
+                           output,
+                           output_ctx);
+
+        // Clear after use
+        if (!diffusion_params.controls.empty()) {
+            clear_control_signals();
+        }
     }
 };
 

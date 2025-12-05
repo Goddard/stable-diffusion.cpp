@@ -417,6 +417,11 @@ namespace Qwen {
             return x;
         }
 
+    public:
+        // Control signals for ControlNet DiT - set before forward, injected after each transformer block
+        std::vector<ggml_tensor*> control_signals;
+        float control_strength = 1.0f;
+
         struct ggml_tensor* forward_orig(GGMLRunnerContext* ctx,
                                          struct ggml_tensor* x,
                                          struct ggml_tensor* timestep,
@@ -440,6 +445,12 @@ namespace Qwen {
                 auto result = block->forward(ctx, img, txt, t_emb, pe);
                 img         = result.first;
                 txt         = result.second;
+
+                // Apply ControlNet DiT signal if available
+                if (i < (int)control_signals.size() && control_signals[i] != nullptr) {
+                    auto scaled = ggml_scale(ctx->ggml_ctx, control_signals[i], control_strength);
+                    img = ggml_add(ctx->ggml_ctx, img, scaled);
+                }
             }
 
             img = norm_out->forward(ctx, img, t_emb);

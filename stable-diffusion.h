@@ -142,6 +142,20 @@ enum lora_apply_mode_t {
     LORA_APPLY_MODE_COUNT,
 };
 
+// Union ControlNet control types (matching ComfyUI's UNION_CONTROLNET_TYPES)
+enum sd_control_type_t {
+    SD_CONTROL_TYPE_AUTO = -1,      // Auto-detect (default)
+    SD_CONTROL_TYPE_OPENPOSE = 0,
+    SD_CONTROL_TYPE_DEPTH = 1,
+    SD_CONTROL_TYPE_SCRIBBLE = 2,   // hed/pidi/scribble/ted
+    SD_CONTROL_TYPE_CANNY = 3,      // canny/lineart/anime_lineart/mlsd
+    SD_CONTROL_TYPE_NORMAL = 4,
+    SD_CONTROL_TYPE_SEGMENT = 5,
+    SD_CONTROL_TYPE_TILE = 6,
+    SD_CONTROL_TYPE_REPAINT = 7,
+    SD_CONTROL_TYPE_COUNT
+};
+
 typedef struct {
     bool enabled;
     int tile_size_x;
@@ -164,6 +178,7 @@ typedef struct {
     const char* vae_path;
     const char* taesd_path;
     const char* control_net_path;
+    const char* control_net_dit_path;  // For DiT-based ControlNet (Qwen/Flux)
     const char* lora_model_dir;
     const char* embedding_dir;
     const char* photo_maker_path;
@@ -197,6 +212,16 @@ typedef struct {
     uint32_t channel;
     uint8_t* data;
 } sd_image_t;
+
+// Control hint with type for Union ControlNets
+// NOTE: Must be declared AFTER sd_image_t
+typedef struct {
+    sd_image_t image;
+    enum sd_control_type_t control_type;
+    float strength;
+    float start_percent;  // When to start applying (0.0 = start)
+    float end_percent;    // When to stop applying (1.0 = end)
+} sd_control_hint_t;
 
 typedef struct {
     int* layers;
@@ -252,8 +277,10 @@ typedef struct {
     float strength;
     int64_t seed;
     int batch_count;
-    sd_image_t control_image;
-    float control_strength;
+    sd_image_t control_image;           // Legacy single control (backwards compat)
+    float control_strength;             // Legacy single control strength
+    sd_control_hint_t* control_hints;   // Multiple control hints for Union ControlNet
+    int control_hints_count;            // Number of control hints
     sd_pm_params_t pm_params;
     sd_tiling_params_t vae_tiling_params;
     sd_easycache_params_t easycache;
@@ -307,6 +334,8 @@ SD_API const char* sd_lora_apply_mode_name(enum lora_apply_mode_t mode);
 SD_API enum lora_apply_mode_t str_to_lora_apply_mode(const char* str);
 
 SD_API void sd_easycache_params_init(sd_easycache_params_t* easycache_params);
+SD_API void sd_control_hint_init(sd_control_hint_t* control_hint);
+SD_API const char* sd_control_type_name(enum sd_control_type_t control_type);
 
 SD_API void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params);
 SD_API char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params);
